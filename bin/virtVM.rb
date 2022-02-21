@@ -23,20 +23,80 @@ EFIFB_ID = 'efi-framebuffer.0'
 $stderr.sync = true
 $stdout.sync = true
 
+class DriverOverrideError < RuntimeError; end
+class InvokeError < RuntimeError; end
+
 def self.infoKernelBug
     $stderr.puts("Most likely means we hit a kernel bug, check your dmesg!")
 end
 
-def self.writeData(file, data, ignoreErrors = false)
+def self.writeData(file, data)
+    pid = nil
     Timeout::timeout(TIMEOUT) do
-        File.open(file, 'wb') do |io|
-            io.write_nonblock(data)
+        # We need to fork and write in child
+        # because if we hit kernel bug it can lockup forever
+        # in that case we just want to abort and not wait eternity
+        # note that in such case neither SIGINT nor SIGTERM would work
+        # sometimes even SIGKILL doesn't work
+        pid = fork do
+            File.open(file, 'wb') do |io|
+                io.write_nonblock(data)
+            end
         end
+        pid, status = Process.wait2(pid)
+        pid = nil
+        return status.success?
     end
 rescue Timeout::Error => error
-    raise error unless ignoreErrors
-    $stderr.puts("This is taking way too long! Tried to write #{data.inspect} into #{file}")
+    $stderr.puts("This is taking way too long!\nTried to write #{data.inspect} into #{file}")
     self.infoKernelBug
+    raise error
+ensure
+    Process.kill(:KILL, pid) if pid
+end
+
+def self.invokeProgram(*cmd)
+    read, write = IO.pipe
+    pid = fork do
+        read.close
+
+        programPid = nil
+        data = Open3.popen2e(*cmd) do |stdin, output, statusWaiter|
+            programPid = statusWaiter.pid
+
+            stdin.close
+            reader = Thread.new { output.read }
+            # we don't want to show confusing exception messages to user so disable this
+            reader.report_on_exception = false
+
+            Timeout::timeout(TIMEOUT) do
+                [reader.value, statusWaiter.value]
+            end
+        end
+        programPid = nil
+        Marshal.dump(data, write)
+    rescue SignalException
+        exit(100)
+    ensure
+        write.close
+        Process.kill(:TERM, programPid) rescue StandardError if programPid
+    end
+    write.close
+
+    data = status = nil
+    Timeout::timeout(TIMEOUT) do
+        data = Marshal.load(read.read)
+        pid, status = Process.wait2(pid)
+    end
+    pid = nil
+
+    raise InvokeError, cmd.join(' ') unless status.success?
+
+    data
+rescue Timeout::Error
+    raise InvokeError, cmd.join(' ')
+ensure
+    Process.kill(:INT, pid) if pid
 end
 
 def self.getVirshCMD(command)
@@ -50,7 +110,7 @@ end
 def self.getVMConfig
     puts("Loading #{VM_NAME} config...")
     cmd = self.getVirshCMD('dumpxml')
-    output, status = Open3.capture2e(*cmd)
+    output, status = self.invokeProgram(*cmd)
     unless status.success?
         $stderr.puts(output)
         $stderr.puts('Failed to get VM config!')
@@ -151,12 +211,11 @@ end
 
 def self.isVMRunning?
     cmd = self.getVirshCMD('domstate')
-    output, status = Open3.capture2e(*cmd)
+    output, status = self.invokeProgram(*cmd)
     if status.success?
         output.strip != 'shut off'
     else
-        $stderr.puts(output)
-        $stderr.puts("Failed to get VM state!")
+        raise 'Failed to get VM state!'
         false
     end
 end
@@ -164,7 +223,7 @@ end
 
 def self.loadModule(name, exitOnError = false)
     puts "Loading #{name} module..."
-    output, status = Open3.capture2e('modprobe', name)
+    output, status = self.invokeProgram('modprobe', name)
     if status.success?
         puts "Module loaded!"
     else
@@ -176,7 +235,7 @@ end
 
 def self.unloadModule(name)
     puts "Unloading #{name} module..."
-    output, status = Open3.capture2e('rmmod', name)
+    output, status = self.invokeProgram('rmmod', name)
     if status.success? || /is not currently loaded/.match?(output)
         puts "Module unloaded!"
     else
@@ -192,7 +251,7 @@ end
 
 def self.findGPUs
     gpus = []
-    output, status = Open3.capture2e('lspci', '-vnD')
+    output, status = self.invokeProgram('lspci', '-vnD')
     if status.success?
         output.each_line do  |line|
             if /\[VGA controller\]/.match?(line)
@@ -209,7 +268,7 @@ end
 
 def self.stopDisplayServer
     puts "Stopping display server..."
-    output, status = Open3.capture2e('systemctl', 'stop', DISPLAY_SERVER)
+    output, status = self.invokeProgram('systemctl', 'stop', DISPLAY_SERVER)
     if status.success?
         puts "Display server stopped!"
     else
@@ -221,7 +280,7 @@ end
 
 def self.startDisplayServer
     puts "Starting display server..."
-    output, status = Open3.capture2e('systemctl', 'start', DISPLAY_SERVER)
+    output, status = self.invokeProgram('systemctl', 'start', DISPLAY_SERVER)
     if status.success?
         puts "Display server started!"
     else
@@ -343,44 +402,45 @@ def self.getDeviceDriver(deviceId)
     driverFolder.readlink.basename.to_s
 end
 
-def self.probeDriver(deviceId, ignoreErrors = false)
-    self.writeData(DRIVER_PROBE_PATH, deviceId, ignoreErrors)
+def self.probeDriver(deviceId)
+    self.writeData(DRIVER_PROBE_PATH, deviceId)
 end
 
-def self.rescanPCI(ignoreErrors = false)
-    self.writeData(PCI_PATH / 'rescan', '1', ignoreErrors)
+def self.rescanPCI()
+    self.writeData(PCI_PATH / 'rescan', '1')
 end
 
-def self.overrideDriver(deviceId, driver, ignoreErrors = false)
+def self.overrideDriver(deviceId, driver)
     devicePath = PCI_DEVICE_PATH / deviceId
     overridePath = devicePath / 'driver_override'
-    self.writeData(overridePath, driver, ignoreErrors)
+    self.writeData(overridePath, driver)
     driverPath = devicePath / 'driver'
     if driverPath.symlink?
         unbindPath = driverPath / 'unbind'
-        self.writeData(unbindPath, deviceId, ignoreErrors)
+        self.writeData(unbindPath, deviceId)
     end
-    self.probeDriver(deviceId, ignoreErrors)
+    self.probeDriver(deviceId)
+    true
+rescue Timeout::Error
+    false
 end
 
 def self.restoreDriver(deviceId)
-    self.overrideDriver(deviceId, "\n", true)
-end
-
-def self.waitForIOMMU
-    '/dev/vfio'
+    self.overrideDriver(deviceId, "\n")
 end
 
 def self.bindVFIO(deviceId)
     currentDriver = self.getDeviceDriver(deviceId)
     if currentDriver != VFIO_PCI_DRIVER
         puts "Overriding device's #{deviceId} driver to #{VFIO_PCI_DRIVER}"
-        self.overrideDriver(deviceId, VFIO_PCI_DRIVER)
+
+        success = self.overrideDriver(deviceId, VFIO_PCI_DRIVER)
+
+        errorMessage = "Failed to bind #{VFIO_PCI_DRIVER} driver for #{deviceId}!"
+        raise DriverOverrideError, errorMessage unless success
+
         newDriver = self.getDeviceDriver(deviceId)
-        if (newDriver != VFIO_PCI_DRIVER)
-            $stderr.puts('Failed to bind driver!')
-            exit(9)
-        end
+        raise DriverOverrideError, errorMessage unless newDriver == VFIO_PCI_DRIVER
     else
         puts "Device #{deviceId} is already using #{VFIO_PCI_DRIVER}!"
     end
@@ -392,9 +452,7 @@ def self.unbindVFIO(deviceId)
         puts "Restoring device's #{deviceId} driver"
         self.restoreDriver(deviceId)
         restoredDriver = self.getDeviceDriver(deviceId)
-        if (restoredDriver == VFIO_PCI_DRIVER)
-            $stderr.puts('Failed to unbind driver!')
-        end
+        $stderr.puts("Failed to unbind driver for #{deviceId}!") if restoredDriver == VFIO_PCI_DRIVER
     else
         puts "Device #{deviceId} is already using correct #{currentDriver}!"
     end
@@ -412,7 +470,32 @@ def self.unbindAll(deviceIds)
     end
 end
 
+def self.handleErrors(error)
+    if error.is_a?(SignalException)
+        $stderr.puts(error)
+    elsif error.is_a?(Timeout::Error)
+        $stderr.puts('Something took too long and we timed out!')
+    else
+        if error.is_a?(InvokeError)
+            $stderr.puts("Failed to execute: #{error.message}")
+        else
+            $stderr.puts(error)
+        end
+        $stderr.puts("Error: #{error.cause}") if error.cause
+    end
+    $stderr.puts('Aborting!')
+end
+
+def self.restoreSystem(deviceIds)
+    self.unbindAll(deviceIds)
+    self.rescanPCI
+    self.loadGPU(deviceIds)
+rescue SignalException, Timeout::Error => error
+    self.handleErrors(error)
+end
+
 def self.startVM(attachConsole = true)
+    shouldRestoreSystem = false
     deviceIds = self.getVFIODevices
 
     if self.isVMRunning?
@@ -424,6 +507,7 @@ def self.startVM(attachConsole = true)
     else
         begin
             self.loadVFIO
+            shouldRestoreSystem = true
             self.unloadGPU(deviceIds)
             self.bindAll(deviceIds)
             self.rescanPCI
@@ -438,48 +522,74 @@ def self.startVM(attachConsole = true)
                     break unless self.isVMRunning?
                 end
             end
-
-        rescue Timeout::Error
-            $stderr.puts("This is taking way too long! Aborting!")
-            self.showTimeoutError
+        rescue DriverOverrideError => error
+            $stderr.puts(error)
+            $stderr.puts('Aborting!')
         end
     end
 
-    self.unbindAll(deviceIds)
-    self.rescanPCI(true)
-    self.loadGPU(deviceIds)
+rescue SignalException, Timeout::Error, InvokeError => error
+    self.handleErrors(error)
+ensure
+    self.restoreSystem(deviceIds) if shouldRestoreSystem
 end
 
 def self.stopVM
-    if self.isVMRunning?
-        puts "Shutting down #{VM_NAME}..."
-        sleep(30) if system(self.getVirshCMD('shutdown').shelljoin)
+    begin
         if self.isVMRunning?
-            puts "VM didn't stop in given time, will force stop!"
-            system(self.getVirshCMD('destroy').shelljoin)
-            sleep(30)
-            $stderr.puts("Failed to stop VM!") if self.isVMRunning?
+            puts "Shutting down #{VM_NAME}..."
+            sleep(30) if system(self.getVirshCMD('shutdown').shelljoin)
+            if self.isVMRunning?
+                puts "VM didn't stop in given time, will force stop!"
+                system(self.getVirshCMD('destroy').shelljoin)
+                sleep(30)
+                $stderr.puts("Failed to stop VM!") if self.isVMRunning?
+            end
+        else
+            puts "#{VM_NAME} is not running!"
         end
-    else
-        puts "#{VM_NAME} is not running!"
+    rescue InvokeError
+        $stderr.puts("Failed to get VM state!")
     end
 
     deviceIds = self.getVFIODevices
-    self.unbindAll(deviceIds)
-    self.rescanPCI(true)
-    self.loadGPU(deviceIds)
+    self.restoreSystem(deviceIds)
+rescue SignalException, Timeout::Error, InvokeError => error
+    self.handleErrors(error)
 end
 
 def main
     command = ARGV.first
+    attachConsole = false
     if command == 'start'
-        unless system([RbConfig.ruby, $0, 'directStart'].shelljoin)
-            self.stopVM
+        shouldStop = true
+        pid = nil
+        begin
+            pid = fork do
+                self.startVM(attachConsole)
+            end
+            pid, status = Process.wait2(pid)
+            shouldStop = !status.success?
+        rescue Interrupt
+            begin
+                Timeout::timeout(TIMEOUT + 5) do
+                    pid, status = Process.wait2(pid)
+                    shouldStop = !status.success?
+                end
+            rescue Timeout::Error
+                # Just abort and try to stop
+            rescue Interrupt
+                # Was aborted by user
+                shouldStop = false
+            ensure
+                Process.kill(:KILL, pid) rescue StandardError if pid
+            end
         end
+        self.stopVM if shouldStop
     elsif command == 'stop'
         self.stopVM
     elsif command == 'directStart'
-        self.startVM(false)
+        self.startVM(attachConsole)
     else
         puts 'Commands: start or stop'
     end
