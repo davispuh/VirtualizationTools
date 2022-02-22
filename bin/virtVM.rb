@@ -15,6 +15,7 @@ TIMEOUT = 60
 PCI_PATH = Pathname.new('/sys/bus/pci')
 PCI_DEVICE_PATH = PCI_PATH / 'devices'
 VFIO_PCI_DRIVER = 'vfio-pci'
+VFIO_PATH = Pathname.new('/dev/vfio')
 DRIVER_PROBE_PATH = '/sys/bus/pci/drivers_probe'
 VTCONSOLE_PATH = Pathname.new('/sys/class/vtconsole/')
 EFIFB_PATH = Pathname.new('/sys/bus/platform/drivers/efi-framebuffer/')
@@ -206,7 +207,7 @@ def self.getVFIODevices
         vfioDeviceIds += iommuGroups[iommuID]
     end
 
-    vfioDeviceIds
+    [iommuGroups.keys, vfioDeviceIds]
 end
 
 def self.isVMRunning?
@@ -470,6 +471,16 @@ def self.unbindAll(deviceIds)
     end
 end
 
+def self.waitForVFIO(groups)
+    Timeout::timeout(TIMEOUT) do
+        groups.each do |group|
+            while !(VFIO_PATH / group).chardev?
+                sleep(1)
+            end
+        end
+    end
+end
+
 def self.handleErrors(error)
     if error.is_a?(SignalException)
         $stderr.puts(error)
@@ -496,7 +507,7 @@ end
 
 def self.startVM(attachConsole = true)
     shouldRestoreSystem = false
-    deviceIds = self.getVFIODevices
+    groups, deviceIds = self.getVFIODevices
 
     if self.isVMRunning?
         puts 'VM is already running! Waiting for it to stop...'
@@ -512,7 +523,8 @@ def self.startVM(attachConsole = true)
             self.bindAll(deviceIds)
             self.rescanPCI
 
-            sleep(5)
+            self.waitForVFIO(groups)
+
             cmd = self.getVirshCMD('start')
             cmd << '--console' if attachConsole
             s = system(cmd.shelljoin)
@@ -552,7 +564,7 @@ def self.stopVM
         $stderr.puts("Failed to get VM state!")
     end
 
-    deviceIds = self.getVFIODevices
+    groups, deviceIds = self.getVFIODevices
     self.restoreSystem(deviceIds)
 rescue SignalException, Timeout::Error, InvokeError => error
     self.handleErrors(error)
