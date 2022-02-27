@@ -171,11 +171,16 @@ end
 
 MULTIPLE_FUNCTIONS_BIT = 1 << 7
 TYPE_MASK = MULTIPLE_FUNCTIONS_BIT ^ 0xFF
+PCI_GENERAL_DEVICE       = 0x00
+PCI_UNINITIALIZED_DEVICE = 0x7F
 
-def self.isRegularPCI?(deviceId)
+def self.isUsableForVFIO?(deviceId)
     config = self.getPCIConfig(deviceId)
-
-    config.headerType & TYPE_MASK == 0
+    deviceType = config.headerType & TYPE_MASK
+    # Keep general PCI device (non-bridge)
+    # Also keep uninitialized device, this happens in case of kernel bug
+    # it won't work but atleast we won't fail when trying to restore drivers
+    [PCI_GENERAL_DEVICE, PCI_UNINITIALIZED_DEVICE].include?(deviceType)
 end
 
 def self.getIOMMUID(deviceIds)
@@ -200,7 +205,7 @@ def self.getVFIODevices(continueOnError = false)
             exit(2)
         end
         # Keep only regular PCI devices, remove PCI-to-PCI Bridges
-        groupedDevices.select! { |deviceId| self.isRegularPCI?(deviceId) }
+        groupedDevices.select! { |deviceId| self.isUsableForVFIO?(deviceId) }
         iommuID = self.getIOMMUID(groupedDevices)
         iommuGroups[iommuID] = groupedDevices.sort
     end
