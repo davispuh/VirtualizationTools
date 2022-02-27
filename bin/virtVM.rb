@@ -120,11 +120,11 @@ def self.executeProgram(cmd, dryRun: false)
     end
 end
 
-def self.getVirshCMD(command)
+def self.getVirshCMD(*commands, withoutVM: false)
     cmd = ['virsh']
     cmd += ['-c', VIRSH_URI] unless VIRSH_URI.to_s.empty?
-    cmd << command
-    cmd << VM_NAME
+    cmd += commands
+    cmd << VM_NAME unless withoutVM
     cmd
 end
 
@@ -434,7 +434,6 @@ def self.unloadGPU(deviceIds, dryRun = false)
     end
     stopDisplayServer(dryRun)
     unbindVTconsoles(dryRun)
-    unbindFramebuffer(dryRun)
     unloadModulesAMD(dryRun)
 end
 
@@ -445,10 +444,6 @@ def self.loadGPU(deviceIds, dryRun = false)
         return
     end
     loadModulesAMD(dryRun)
-    gpus.each do |deviceId|
-        restoreDriver(deviceId, dryRun)
-    end
-    bindFramebuffer(dryRun)
     bindVTconsoles(dryRun)
     startDisplayServer(dryRun)
 end
@@ -517,6 +512,36 @@ def self.unbindVFIO(deviceId, dryRun = false)
     end
 end
 
+def self.getVirshDeviceId(deviceId)
+    'pci_' + deviceId.gsub(':', '_').gsub('.', '_')
+end
+
+def self.detachDevice(deviceId, dryRun = false)
+    puts "Detaching #{deviceId} from host"
+    cmd = self.getVirshCMD('nodedev-detach', self.getVirshDeviceId(deviceId), withoutVM: true)
+    output, status = self.invokeProgram(*cmd, dryRun: dryRun)
+    return if dryRun
+    if status.success?
+        puts "Device #{deviceId} detached!"
+    else
+        $stderr.puts(output)
+        raise DriverOverrideError.new("Failed to detach #{deviceId} device!")
+    end
+end
+
+def self.reattachDevice(deviceId, dryRun = false)
+    puts "Reattaching #{deviceId} to host"
+    cmd = self.getVirshCMD('nodedev-reattach', self.getVirshDeviceId(deviceId), withoutVM: true)
+    output, status = self.invokeProgram(*cmd, dryRun: dryRun)
+    return if dryRun
+    if status.success?
+        puts "Device #{deviceId} reattached!"
+    else
+        $stderr.puts(output)
+        $stderr.puts("Failed to reattach #{deviceId} device!")
+    end
+end
+
 def self.bindAll(deviceIds, dryRun = false)
     deviceIds.each do |deviceId|
         self.bindVFIO(deviceId, dryRun)
@@ -526,6 +551,18 @@ end
 def self.unbindAll(deviceIds, dryRun = false)
     deviceIds.each do |deviceId|
         self.unbindVFIO(deviceId, dryRun)
+    end
+end
+
+def self.detatchAll(deviceIds, dryRun = false)
+    deviceIds.each do |deviceId|
+        self.detachDevice(deviceId, dryRun)
+    end
+end
+
+def self.reattachAll(deviceIds, dryRun = false)
+    deviceIds.each do |deviceId|
+        self.reattachDevice(deviceId, dryRun)
     end
 end
 
@@ -556,7 +593,7 @@ def self.handleErrors(error)
 end
 
 def self.restoreSystem(deviceIds, dryRun = false)
-    self.unbindAll(deviceIds, dryRun)
+    self.reattachAll(deviceIds, dryRun)
     self.rescanPCI(dryRun)
     self.loadGPU(deviceIds, dryRun)
 rescue SignalException, Timeout::Error => error
@@ -580,10 +617,7 @@ def self.startVM(options)
             self.loadVFIO(dryRun)
             shouldRestoreSystem = true
             self.unloadGPU(deviceIds, dryRun)
-            self.bindAll(deviceIds, dryRun)
-            self.rescanPCI(dryRun)
-
-            self.waitForVFIO(groups) unless dryRun
+            self.detatchAll(deviceIds, dryRun)
             cmd = self.getVirshCMD('start')
             cmd << '--console' if options[:attachConsole]
             success = self.executeProgram(cmd, dryRun: dryRun)
