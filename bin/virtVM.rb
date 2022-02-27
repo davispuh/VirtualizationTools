@@ -41,7 +41,7 @@ def self.writeData(file, data)
         # sometimes even SIGKILL doesn't work
         pid = fork do
             File.open(file, 'wb') do |io|
-                io.write_nonblock(data)
+                io.write(data)
             end
         end
         pid, status = Process.wait2(pid)
