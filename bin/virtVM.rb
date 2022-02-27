@@ -18,8 +18,8 @@ VFIO_PCI_DRIVER = 'vfio-pci'
 VFIO_PATH = Pathname.new('/dev/vfio')
 DRIVER_PROBE_PATH = '/sys/bus/pci/drivers_probe'
 VTCONSOLE_PATH = Pathname.new('/sys/class/vtconsole/')
-EFIFB_PATH = Pathname.new('/sys/bus/platform/drivers/efi-framebuffer/')
-EFIFB_ID = 'efi-framebuffer.0'
+FBDEV_PATTERN = '/dev/fb*'
+CHARDEV_PATH = Pathname.new('/sys/dev/char')
 
 $stderr.sync = true
 $stdout.sync = true
@@ -373,24 +373,46 @@ def self.bindVTconsoles(dryRun = false)
     end
 end
 
-def self.unbindEFIFB(dryRun = false)
-    if (EFIFB_PATH / EFIFB_ID).symlink?
-        puts "Unbinding EFI framebuffer..."
-        self.writeData(EFIFB_PATH / 'unbind', EFIFB_ID, dryRun)
-        puts "Unbinded!" unless dryRun
+def self.getFramebufferDevice(exitOnError = false)
+    fbdevs = Dir[FBDEV_PATTERN]
+    if fbdevs.empty?
+        puts "Didn't find framebuffer!"
+        return
+    elsif fbdevs.length > 1
+        $stderr.puts("Found multiple framebuffers: #{fbdevs.join(',')}")
+        $stderr.puts('Currently multiple framebuffer support is not implemented!')
+        exit(3) if exitOnError
+        return
+    end
+    puts "Found framebuffer #{fbdevs.first}"
+    stat = File.stat(fbdevs.first)
+    if stat.chardev?
+        id = [stat.rdev_major, stat.rdev_minor].join(':')
+        deviceLink = CHARDEV_PATH / id / 'device'
+        if deviceLink.symlink?
+            deviceLink.readlink.basename.to_s
+        else
+            $stderr.puts("Expected #{deviceLink} to be a symlink!")
+            exit(3) if exitOnError
+        end
     else
-        puts 'EFI framebuffer not present (probably already unbinded)'
+        $stderr.puts("Expected #{fbdevs.first} to be a character device!")
+        exit(3) if exitOnError
     end
 end
 
-def self.bindEFIFB(dryRun = false)
-    puts "Binding EFI framebuffer..."
-    begin
-        self.writeData(EFIFB_PATH / 'bind', EFIFB_ID, dryRun)
-        puts "Binded!" unless dryRun
-    rescue Errno::EINVAL
-        $stderr.puts('Failed to bind EFI framebuffer!')
-    end
+def self.unbindFramebuffer(dryRun = false)
+    fbdev = self.getFramebufferDevice(true)
+    return unless fbdev
+    puts "Unbinding #{fbdev} framebuffer..."
+    self.bindVFIO(fbdev, dryRun)
+end
+
+def self.bindFramebuffer(dryRun = false)
+    fbdev = self.getFramebufferDevice(false)
+    return unless fbdev
+    puts "Binding #{fbdev} framebuffer..."
+    self.unbindVFIO(fbdev, dryRun)
 end
 
 def self.unloadModulesAMD(dryRun = false)
@@ -412,7 +434,7 @@ def self.unloadGPU(deviceIds, dryRun = false)
     end
     stopDisplayServer(dryRun)
     unbindVTconsoles(dryRun)
-    unbindEFIFB(dryRun)
+    unbindFramebuffer(dryRun)
     unloadModulesAMD(dryRun)
 end
 
@@ -426,7 +448,7 @@ def self.loadGPU(deviceIds, dryRun = false)
     gpus.each do |deviceId|
         restoreDriver(deviceId, dryRun)
     end
-    bindEFIFB(dryRun)
+    bindFramebuffer(dryRun)
     bindVTconsoles(dryRun)
     startDisplayServer(dryRun)
 end
