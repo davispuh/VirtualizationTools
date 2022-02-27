@@ -134,15 +134,15 @@ end
 def self.pciExist?(deviceId)
     unless (PCI_DEVICE_PATH / deviceId).directory?
         $stderr.puts("Didn't find #{deviceId} device!")
-        exit(2)
+        return false
     end
     true
 end
 
 def self.hasIOMMU?(deviceId)
     unless (PCI_DEVICE_PATH / deviceId / 'iommu_group').directory?
-        $stderr.puts("It seems IOMMU isn't enabled!")
-        exit(3)
+        $stderr.puts("Device #{deviceId} doesn't support IOMMU so can't use it!")
+        return false
     end
     true
 end
@@ -182,7 +182,7 @@ def self.getIOMMUID(deviceIds)
     (PCI_DEVICE_PATH / deviceIds.first / 'iommu_group').readlink.basename.to_s
 end
 
-def self.getVFIODevices
+def self.getVFIODevices(continueOnError = false)
     vmConfig = self.getVMConfig
 
     deviceIds = self.findPCIDevices(vmConfig)
@@ -195,6 +195,10 @@ def self.getVFIODevices
     iommuGroups = {}
     deviceIds.each do |deviceId|
         groupedDevices = self.findGroupedDevices(deviceId)
+        if !groupedDevices
+            next if continueOnError
+            exit(2)
+        end
         # Keep only regular PCI devices, remove PCI-to-PCI Bridges
         groupedDevices.select! { |deviceId| self.isRegularPCI?(deviceId) }
         iommuID = self.getIOMMUID(groupedDevices)
@@ -507,7 +511,7 @@ end
 
 def self.startVM(attachConsole = true)
     shouldRestoreSystem = false
-    groups, deviceIds = self.getVFIODevices
+    groups, deviceIds = self.getVFIODevices(false)
 
     if self.isVMRunning?
         puts 'VM is already running! Waiting for it to stop...'
@@ -564,7 +568,7 @@ def self.stopVM
         $stderr.puts("Failed to get VM state!")
     end
 
-    groups, deviceIds = self.getVFIODevices
+    groups, deviceIds = self.getVFIODevices(true)
     self.restoreSystem(deviceIds)
 rescue SignalException, Timeout::Error, InvokeError => error
     self.handleErrors(error)
