@@ -445,7 +445,7 @@ def self.bindVFIO(deviceId)
         raise DriverOverrideError, errorMessage unless success
 
         newDriver = self.getDeviceDriver(deviceId)
-        raise DriverOverrideError, errorMessage unless newDriver == VFIO_PCI_DRIVER
+        raise DriverOverrideError, errorMessage if newDriver != VFIO_PCI_DRIVER && !newDriver.empty?
     else
         puts "Device #{deviceId} is already using #{VFIO_PCI_DRIVER}!"
     end
