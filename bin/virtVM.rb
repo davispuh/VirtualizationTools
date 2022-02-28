@@ -306,7 +306,6 @@ def self.stopDisplayServer(dryRun = false)
     else
         $stderr.puts(output)
         $stderr.puts('Failed to stop display server!')
-        exit(7)
     end
 end
 
